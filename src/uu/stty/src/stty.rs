@@ -153,12 +153,65 @@ enum PrintSetting {
     Size,
 }
 
+const EXPECTED_PARTS: usize = 4 + nix::libc::NCCS;
+
+/// Saved-state format:
+/// - `s[0]`: input flags
+/// - `s[1]`: output flags
+/// - `s[2]`: control flags
+/// - `s[3]`: local flags
+/// - `s[4..]`: control characters (optional)
+#[derive(Clone, Debug)]
+struct State([u32; EXPECTED_PARTS]);
+impl State {
+    /// Parse a saved terminal state string in stty format.
+    ///
+    /// The format is colon-separated hexadecimal values:
+    /// `input_flags:output_flags:control_flags:local_flags:cc0:cc1:cc2:...`
+    ///
+    /// - Must have exactly `EXPECTED_PARTS` (4 flags + platform-specific control characters)
+    /// - All parts must be non-empty valid hex values
+    /// - Control characters must fit in `u8` (0-255)
+    /// - Returns `None` if format is invalid
+    #[must_use]
+    fn new(arg: &str) -> Option<Self> {
+        let mut values = Self([0; EXPECTED_PARTS]);
+        let mut i = 0;
+        for part in arg.split(':') {
+            if i >= values.0.len() {
+                return None;
+            }
+            // `from_str_radix` doesn't document its behavior for this case,
+            // thus, we do this to guarantee stability
+            if part.is_empty() {
+                return None;
+            }
+            // TO-DO: avoid `from_str_radix`
+            if part.as_bytes()[0] == b'+' {
+                return None;
+            }
+            let val = u32::from_str_radix(part, 16).ok()?;
+
+            // Control characters (indices 4+) must fit in u8
+            if i >= 4 && val > 255 {
+                return None;
+            }
+            values.0[i] = val;
+            i += 1;
+        }
+        if i < values.0.len() {
+            return None;
+        }
+        Some(values)
+    }
+}
+
 enum ArgOptions<'a> {
     Flags(AllFlags<'a>),
     Mapping((S, u8)),
     Special(SpecialSetting),
     Print(PrintSetting),
-    SavedState(Vec<u32>),
+    SavedState(State),
 }
 
 impl<'a> From<AllFlags<'a>> for ArgOptions<'a> {
@@ -364,7 +417,7 @@ fn stty(opts: &Options) -> UResult<()> {
                 }
                 _ => {
                     // Try to parse saved format (hex string like "6d02:5:4bf:8a3b:...")
-                    if let Some(state) = parse_saved_state(arg) {
+                    if let Some(state) = State::new(arg) {
                         valid_args.push(ArgOptions::SavedState(state));
                     }
                     // control char
@@ -509,49 +562,6 @@ fn parse_rows_cols(arg: &str) -> Option<u16> {
         .ok()
         .filter(|&n| u32::try_from(n).is_ok())
         .map(|n| (n % (u16::MAX as u64 + 1)) as u16)
-}
-
-/// Parse a saved terminal state string in stty format.
-///
-/// The format is colon-separated hexadecimal values:
-/// `input_flags:output_flags:control_flags:local_flags:cc0:cc1:cc2:...`
-///
-/// - Must have exactly 4 + NCCS parts (4 flags + platform-specific control characters)
-/// - All parts must be non-empty valid hex values
-/// - Control characters must fit in u8 (0-255)
-/// - Returns `None` if format is invalid
-fn parse_saved_state(arg: &str) -> Option<Vec<u32>> {
-    let parts: Vec<&str> = arg.split(':').collect();
-    let expected_parts = 4 + nix::libc::NCCS;
-
-    // GNU requires exactly the right number of parts for this platform
-    if parts.len() != expected_parts {
-        return None;
-    }
-
-    // Validate all parts are non-empty valid hex
-    let mut values = Vec::with_capacity(expected_parts);
-    for (i, part) in parts.iter().enumerate() {
-        // `from_str_radix` doesn't document its behavior for this case,
-        // thus, we do this to guarantee stability
-        if part.is_empty() {
-            return None; // GNU rejects empty hex values
-        }
-        // TO-DO: avoid `from_str_radix`
-        if part.as_bytes()[0] == b'+' {
-            return None;
-        }
-        let val = u32::from_str_radix(part, 16).ok()?;
-
-        // Control characters (indices 4+) must fit in u8
-        if i >= 4 && val > 255 {
-            return None;
-        }
-
-        values.push(val);
-    }
-
-    Some(values)
 }
 
 fn check_flag_group<T>(flag: &Flag<T>, remove: bool) -> bool {
@@ -1018,30 +1028,15 @@ fn apply_char_mapping(termios: &mut Termios, mapping: &(S, u8)) {
 }
 
 /// Apply a saved terminal state to the current termios.
-///
-/// The state array contains:
-/// - `state[0]`: input flags
-/// - `state[1]`: output flags
-/// - `state[2]`: control flags
-/// - `state[3]`: local flags
-/// - `state[4..]`: control characters (optional)
-///
-/// If state has fewer than 4 elements, no changes are applied. This is a defensive
-/// check that should never trigger since `parse_saved_state` rejects such states.
-fn apply_saved_state(termios: &mut Termios, state: &[u32]) {
-    // Require at least 4 elements for the flags (defensive check)
-    if state.len() < 4 {
-        return; // No-op for invalid state (already validated by parser)
-    }
-
+fn apply_saved_state(termios: &mut Termios, s: &State) {
     // Apply the four flag groups, done (as _) for MacOS size compatibility
-    termios.input_flags = InputFlags::from_bits_truncate(state[0] as _);
-    termios.output_flags = OutputFlags::from_bits_truncate(state[1] as _);
-    termios.control_flags = ControlFlags::from_bits_truncate(state[2] as _);
-    termios.local_flags = LocalFlags::from_bits_truncate(state[3] as _);
+    termios.input_flags = InputFlags::from_bits_truncate(s.0[0] as _);
+    termios.output_flags = OutputFlags::from_bits_truncate(s.0[1] as _);
+    termios.control_flags = ControlFlags::from_bits_truncate(s.0[2] as _);
+    termios.local_flags = LocalFlags::from_bits_truncate(s.0[3] as _);
 
-    // Apply control characters if present (stored as u32 but used as u8)
-    for (i, &cc_val) in state.iter().skip(4).enumerate() {
+    // Apply control characters (stored as u32 but used as u8)
+    for (i, &cc_val) in s.0.iter().skip(4).enumerate() {
         if i < termios.control_chars.len() {
             termios.control_chars[i] = cc_val as u8;
         }
