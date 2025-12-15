@@ -528,6 +528,38 @@ fn parse_saved_state(arg: &str) -> Option<Vec<u32>> {
 
     Some(values)
 }
+const EXPECTED_PARTS: usize = 4 + nix::libc::NCCS;
+fn parse_saved_state(arg: &str) -> Option<[u32; EXPECTED_PARTS]> {
+    let mut values = [0; EXPECTED_PARTS];
+    let mut i_part = 0;
+    for i in 0..arg.len() {
+        arg[i..].chars().find(|c| c == ':');
+        // `from_str_radix` doesn't document its behavior for this case,
+        // thus, we do this to guarantee stability
+        if part.is_empty() {
+            return None; // GNU rejects empty hex values
+        }
+        // TO-DO: avoid `from_str_radix`
+        if part.starts_with('+') {
+            return None;
+        };
+        let val = u32::from_str_radix(part, 16).ok()?;
+
+        // Control characters (indices 4+) must fit in u8
+        if i_part >= 4 && val > 255 {
+            return None;
+        }
+        values[i_part] = val;
+        i_part += 1;
+        if i_part > EXPECTED_PARTS {
+            return None;
+        }
+    }
+    if i_part < EXPECTED_PARTS {
+        return None;
+    }
+    Some(values)
+}
 
 fn check_flag_group<T>(flag: &Flag<T>, remove: bool) -> bool {
     remove && flag.group.is_some()
@@ -997,7 +1029,7 @@ fn apply_char_mapping(termios: &mut Termios, mapping: &(S, u8)) {
 ///
 /// The state array contains:
 /// - `state[0]`: input flags
-/// - `state[1]`: output flags  
+/// - `state[1]`: output flags
 /// - `state[2]`: control flags
 /// - `state[3]`: local flags
 /// - `state[4..]`: control characters (optional)
