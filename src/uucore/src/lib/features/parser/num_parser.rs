@@ -43,9 +43,10 @@ impl Base {
             Self::Binary => ('0'..='1').contains(&c).then(|| from_decimal(c)),
             Self::Octal => ('0'..='7').contains(&c).then(|| from_decimal(c)),
             Self::Decimal => c.is_ascii_digit().then(|| from_decimal(c)),
-            Self::Hexadecimal => match c.to_ascii_lowercase() {
+            Self::Hexadecimal => match c {
                 '0'..='9' => Some(from_decimal(c)),
                 c @ 'a'..='f' => Some(u64::from(c) - u64::from('a') + 10),
+                c @ 'A'..='F' => Some(u64::from(c) - u64::from('A') + 10),
                 _ => None,
             },
         }
